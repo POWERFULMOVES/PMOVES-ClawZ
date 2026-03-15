@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/nats-bridge",
+  "version": "2026.3.15",
+  "description": "Publish OpenClaw events to PMOVES NATS bus",
+  "type": "module",
+  "dependencies": {
+    "nats": "^2.28.0"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
