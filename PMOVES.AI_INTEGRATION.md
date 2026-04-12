@@ -20,8 +20,13 @@ Inside PMOVES.AI, ClawZ serves three roles:
    `message:sent`, `channel:connected/disconnected`) onto the PMOVES NATS bus
    through the `nats-bridge` extension at `extensions/nats-bridge/`.
 3. **Model provider host** — ships the bundled NVIDIA provider catalog at
-   `extensions/nvidia/` so OpenClaw runtime can call NIM-hosted Nemotron / Llama
-   endpoints through the PMOVES TensorZero routing tier.
+   `extensions/nvidia/` so OpenClaw runtime can call NVIDIA-hosted Nemotron /
+   Llama endpoints. **Default routing:** the catalog's `NVIDIA_BASE_URL` points
+   at NVIDIA's hosted API (`https://integrate.api.nvidia.com/v1`). To route
+   through the local PMOVES NIM container instead (`http://nvidia-nim:8000/v1`)
+   or via TensorZero's gateway, operators must override `NVIDIA_BASE_URL` in
+   the plugin runtime environment or register a separate provider entry
+   (TBD follow-up — tracked as future work, not wired in this integration).
 
 ## PMOVES Overlay Surface
 - **Overlay path:** repo-root submodule `PMOVES-ClawZ/` (no `pmoves-integrations/`
@@ -76,7 +81,7 @@ never blocks message routing.
 | Subject | Trigger | Payload shape |
 |---|---|---|
 | `openclaw.message.received.v1` | OpenClaw runtime `message:received` event on any channel adapter | `{ channel: string, message_id?: string, author?: string, content_length: number, timestamp: ISO-8601 }` |
-| `openclaw.message.sent.v1` | OpenClaw runtime `message:sent` event | `{ channel: string, message_id?: string, content_length: number, timestamp: ISO-8601 }` |
+| `openclaw.message.sent.v1` | OpenClaw runtime `message:sent` event | `{ channel: string, message_id?: string, author?: string, content_length: number, timestamp: ISO-8601 }` |
 | `openclaw.channel.connected.v1` | OpenClaw runtime `channel:connected` **or** `channel:disconnected` event | `{ channel: string, status: "connected" \| "disconnected", timestamp: ISO-8601 }` |
 
 All three subjects follow the PMOVES `<domain>.<noun>.<verb>.v<major>` naming
