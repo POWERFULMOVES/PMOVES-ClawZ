@@ -43,6 +43,15 @@ export function buildNvidiaProvider(): ModelProviderConfig {
         contextWindow: 8192,
         maxTokens: 2048,
       },
+      {
+        id: "nvidia/llama-3.3-nemotron-super-49b-v1",
+        name: "Nemotron Super 49B",
+        reasoning: true,
+        input: ["text"],
+        cost: NVIDIA_DEFAULT_COST,
+        contextWindow: 131072,
+        maxTokens: 4096,
+      },
     ],
   };
 }
