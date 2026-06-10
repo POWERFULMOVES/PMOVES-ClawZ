@@ -1,3 +1,4 @@
+// Tests collect-mode queue behavior, debounce, and drain semantics.
 import { describe, expect, it, vi } from "vitest";
 import type { FollowupRun, QueueSettings } from "./queue.js";
 import { enqueueFollowupRun, scheduleFollowupDrain } from "./queue.js";
@@ -96,6 +97,110 @@ describe("followup queue collect routing", () => {
     expect(calls[0]?.originatingTo).toBe("channel:A");
   });
 
+  it("collects compatible items after one cross-channel drain", async () => {
+    const key = `test-collect-after-cross-${Date.now()}`;
+    const calls: FollowupRun[] = [];
+    const done = createDeferred<void>();
+    const runFollowup = async (run: FollowupRun) => {
+      calls.push(run);
+      if (calls.length >= 2) {
+        done.resolve();
+      }
+    };
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 0,
+      cap: 50,
+      dropPolicy: "summarize",
+    };
+
+    enqueueFollowupRun(
+      key,
+      createRun({
+        prompt: "first route",
+        originatingChannel: "slack",
+        originatingTo: "channel:A",
+      }),
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      createRun({
+        prompt: "second route one",
+        originatingChannel: "slack",
+        originatingTo: "channel:B",
+      }),
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      createRun({
+        prompt: "second route two",
+        originatingChannel: "slack",
+        originatingTo: "channel:B",
+      }),
+      settings,
+    );
+
+    scheduleFollowupDrain(key, runFollowup);
+    await done.promise;
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.prompt).toBe("first route");
+    expect(calls[1]?.prompt).toContain("[Queued messages while agent was busy]");
+    expect(calls[1]?.prompt).toContain("Queued #1\nsecond route one");
+    expect(calls[1]?.prompt).toContain("Queued #2\nsecond route two");
+    expect(calls[1]?.originatingChannel).toBe("slack");
+    expect(calls[1]?.originatingTo).toBe("channel:B");
+  });
+
+  it("collects unresolved-origin items with an otherwise single route", async () => {
+    const key = `test-collect-unresolved-origin-${Date.now()}`;
+    const calls: FollowupRun[] = [];
+    const done = createDeferred<void>();
+    const runFollowup = async (run: FollowupRun) => {
+      calls.push(run);
+      done.resolve();
+    };
+    const settings: QueueSettings = {
+      mode: "collect",
+      debounceMs: 0,
+      cap: 50,
+      dropPolicy: "summarize",
+    };
+
+    enqueueFollowupRun(key, createRun({ prompt: "unresolved origin" }), settings);
+    enqueueFollowupRun(
+      key,
+      createRun({
+        prompt: "keyed one",
+        originatingChannel: "slack",
+        originatingTo: "channel:B",
+      }),
+      settings,
+    );
+    enqueueFollowupRun(
+      key,
+      createRun({
+        prompt: "keyed two",
+        originatingChannel: "slack",
+        originatingTo: "channel:B",
+      }),
+      settings,
+    );
+
+    scheduleFollowupDrain(key, runFollowup);
+    await done.promise;
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.prompt).toContain("[Queued messages while agent was busy]");
+    expect(calls[0]?.prompt).toContain("Queued #1\nunresolved origin");
+    expect(calls[0]?.prompt).toContain("Queued #2\nkeyed one");
+    expect(calls[0]?.prompt).toContain("Queued #3\nkeyed two");
+    expect(calls[0]?.originatingChannel).toBe("slack");
+    expect(calls[0]?.originatingTo).toBe("channel:B");
+  });
+
   it("collects ordinary user-request followups with current turn kind", async () => {
     const key = `test-collect-user-request-kind-${Date.now()}`;
     const calls: FollowupRun[] = [];
@@ -115,7 +220,7 @@ describe("followup queue collect routing", () => {
       key,
       createRun({
         prompt: "one",
-        currentTurnKind: "user_request",
+        currentInboundEventKind: "user_request",
         originatingChannel: "slack",
         originatingTo: "channel:A",
       }),
@@ -125,7 +230,7 @@ describe("followup queue collect routing", () => {
       key,
       createRun({
         prompt: "two",
-        currentTurnKind: "user_request",
+        currentInboundEventKind: "user_request",
         originatingChannel: "slack",
         originatingTo: "channel:A",
       }),
@@ -175,8 +280,9 @@ describe("followup queue collect routing", () => {
     if (!first) {
       throw new Error("expected queued followup");
     }
-    first.currentTurnKind = "room_event";
-    first.currentTurnContext = { text: "room event body" };
+    first.currentInboundEventKind = "room_event";
+    first.currentInboundAudio = true;
+    first.currentInboundContext = { text: "room event body" };
     first.abortSignal = controller.signal;
     first.deliveryCorrelations = [{ begin }];
     first.queuedLifecycle = lifecycle;
@@ -195,8 +301,9 @@ describe("followup queue collect routing", () => {
 
     expect(calls).toHaveLength(2);
     expect(calls[0]?.prompt).toBe("[OpenClaw room event]");
-    expect(calls[0]?.currentTurnKind).toBe("room_event");
-    expect(calls[0]?.currentTurnContext?.text).toBe("room event body");
+    expect(calls[0]?.currentInboundEventKind).toBe("room_event");
+    expect(calls[0]?.currentInboundAudio).toBe(true);
+    expect(calls[0]?.currentInboundContext?.text).toBe("room event body");
     expect(calls[0]?.abortSignal).toBe(controller.signal);
     expect(calls[0]?.deliveryCorrelations?.[0]?.begin).toBe(begin);
     expect(calls[0]?.queuedLifecycle).toBe(lifecycle);
@@ -988,7 +1095,9 @@ describe("followup queue collect routing", () => {
       }
       calls.push(run);
     });
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
 
     expect(calls).toHaveLength(0);
     expect(cleaned.map((run) => run.prompt)).toEqual(["aborted"]);
@@ -1243,8 +1352,8 @@ describe("followup queue collect routing", () => {
       key,
       {
         ...createRun({ prompt: "dropped ambient" }),
-        currentTurnKind: "room_event",
-        currentTurnContext: { text: "dropped context" },
+        currentInboundEventKind: "room_event",
+        currentInboundContext: { text: "dropped context" },
       },
       settings,
     );
@@ -1252,8 +1361,9 @@ describe("followup queue collect routing", () => {
       key,
       {
         ...createRun({ prompt: "live ambient" }),
-        currentTurnKind: "room_event",
-        currentTurnContext: { text: "live context" },
+        currentInboundEventKind: "room_event",
+        currentInboundAudio: true,
+        currentInboundContext: { text: "live context" },
         abortSignal: controller.signal,
         deliveryCorrelations: [{ begin }],
         queuedLifecycle: { onComplete },
@@ -1266,8 +1376,9 @@ describe("followup queue collect routing", () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0]?.prompt).toContain("[Queue overflow] Dropped 1 message due to cap.");
-    expect(calls[0]?.currentTurnKind).toBe("room_event");
-    expect(calls[0]?.currentTurnContext?.text).toBe("live context");
+    expect(calls[0]?.currentInboundEventKind).toBe("room_event");
+    expect(calls[0]?.currentInboundAudio).toBe(true);
+    expect(calls[0]?.currentInboundContext?.text).toBe("live context");
     expect(calls[0]?.abortSignal).toBe(controller.signal);
     expect(calls[0]?.queuedLifecycle?.onComplete).toBe(onComplete);
     expect(calls[0]?.deliveryCorrelations?.[0]?.begin).toBe(begin);
@@ -1294,8 +1405,8 @@ describe("followup queue collect routing", () => {
       key,
       {
         ...createRun({ prompt: "dropped ambient" }),
-        currentTurnKind: "room_event",
-        currentTurnContext: { text: "dropped context" },
+        currentInboundEventKind: "room_event",
+        currentInboundContext: { text: "dropped context" },
         abortSignal: controller.signal,
         queuedLifecycle: { onComplete },
       },
@@ -1308,12 +1419,14 @@ describe("followup queue collect routing", () => {
 
     scheduleFollowupDrain(key, runFollowup);
     await done.promise;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
 
     expect(calls).toHaveLength(1);
     expect(calls[0]?.prompt).toContain("[Queue overflow] Dropped 1 message due to cap.");
-    expect(calls[0]?.currentTurnKind).toBeUndefined();
-    expect(calls[0]?.currentTurnContext).toBeUndefined();
+    expect(calls[0]?.currentInboundEventKind).toBeUndefined();
+    expect(calls[0]?.currentInboundContext).toBeUndefined();
     expect(calls[0]?.abortSignal).toBeUndefined();
     expect(onComplete).toHaveBeenCalledTimes(1);
   });
@@ -1347,8 +1460,8 @@ describe("followup queue collect routing", () => {
       key,
       {
         ...createRun({ prompt: "dropped ambient" }),
-        currentTurnKind: "room_event",
-        currentTurnContext: { text: "dropped context" },
+        currentInboundEventKind: "room_event",
+        currentInboundContext: { text: "dropped context" },
         queuedLifecycle: { onComplete },
       },
       settings,
@@ -1357,7 +1470,9 @@ describe("followup queue collect routing", () => {
 
     scheduleFollowupDrain(key, runFollowup);
     await firstAttempt.promise;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
 
     expect(onComplete).toHaveBeenCalledTimes(1);
     expect(getExistingFollowupQueue(key)?.summarySources).toHaveLength(0);

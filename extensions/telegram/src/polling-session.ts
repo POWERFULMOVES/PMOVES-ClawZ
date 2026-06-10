@@ -1,17 +1,26 @@
+// Telegram plugin module implements polling session behavior.
 import { type RunOptions, run } from "@grammyjs/runner";
 import type { ChannelAccountSnapshot } from "openclaw/plugin-sdk/channel-contract";
 import type { TelegramNetworkConfig } from "openclaw/plugin-sdk/config-contracts";
 import { drainPendingDeliveries } from "openclaw/plugin-sdk/delivery-queue-runtime";
 import {
+  collectErrorGraphCandidates,
+  formatErrorMessage,
+  readErrorName,
+} from "openclaw/plugin-sdk/error-runtime";
+import {
+  clampPositiveTimerTimeoutMs,
+  resolvePositiveTimerTimeoutMs,
+} from "openclaw/plugin-sdk/number-runtime";
+import {
   computeBackoff,
   formatDurationPrecise,
   sleepWithAbort,
 } from "openclaw/plugin-sdk/runtime-env";
-import { formatErrorMessage } from "openclaw/plugin-sdk/ssrf-runtime";
 import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
 import { withTelegramApiErrorLogging } from "./api-logging.js";
 import { createTelegramBot } from "./bot.js";
-import { type TelegramTransport } from "./fetch.js";
+import type { TelegramTransport } from "./fetch.js";
 import { isRecoverableTelegramNetworkError } from "./network-errors.js";
 import { TelegramPollingLivenessTracker } from "./polling-liveness.js";
 import { createTelegramPollingStatusPublisher } from "./polling-status.js";
@@ -21,12 +30,14 @@ import { getTelegramSequentialKey } from "./sequential-key.js";
 import {
   claimTelegramSpooledUpdate,
   deleteTelegramSpooledUpdate,
+  failTelegramSpooledUpdateClaim,
   isTelegramSpooledUpdateClaimOwnedByOtherLiveProcess,
   listTelegramSpooledUpdateClaims,
   listTelegramSpooledUpdates,
   recoverStaleTelegramSpooledUpdateClaims,
   releaseTelegramSpooledUpdateClaim,
   resolveTelegramIngressSpoolDir,
+  writeTelegramSpooledUpdate,
   type ClaimedTelegramSpooledUpdate,
   type TelegramSpooledUpdate,
 } from "./telegram-ingress-spool.js";
@@ -34,13 +45,70 @@ import {
   createTelegramIngressWorker,
   type TelegramIngressWorkerFactory,
 } from "./telegram-ingress-worker.js";
+import {
+  buildTelegramReplyFenceLaneKey,
+  supersedeTelegramReplyFenceLane,
+} from "./telegram-reply-fence.js";
 
 const TELEGRAM_POLL_RESTART_POLICY = {
-  initialMs: 2000,
-  maxMs: 30_000,
-  factor: 1.8,
-  jitter: 0.25,
+  initialMs: 30_000,
+  maxMs: 600_000,
+  factor: 2,
+  jitter: 0.2,
 };
+
+const TELEGRAM_POLL_STOP_TIMEOUT_COOLDOWN_POLICY = {
+  initialMs: 120_000,
+  maxMs: 600_000,
+  factor: 2,
+  jitter: 0.2,
+};
+const TELEGRAM_POLL_STOP_TIMEOUT_BURST_LIMIT = 2;
+
+type TelegramRestartBackoffState = {
+  restartAttempts: number;
+  stopTimeoutBurst: number;
+  stopTimeoutCooldownAttempts: number;
+};
+
+function createTelegramRestartBackoffState(): TelegramRestartBackoffState {
+  return {
+    restartAttempts: 0,
+    stopTimeoutBurst: 0,
+    stopTimeoutCooldownAttempts: 0,
+  };
+}
+
+function resetTelegramRestartBackoffState(state: TelegramRestartBackoffState): void {
+  state.restartAttempts = 0;
+  state.stopTimeoutBurst = 0;
+  state.stopTimeoutCooldownAttempts = 0;
+}
+
+function resolveTelegramRestartDelayMs(
+  state: TelegramRestartBackoffState,
+  opts: { stopTimedOut?: boolean } = {},
+): { delayMs: number; stopTimeoutSuffix: string } {
+  state.restartAttempts += 1;
+  let delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, state.restartAttempts);
+  let stopTimeoutSuffix = "";
+  if (opts.stopTimedOut) {
+    state.stopTimeoutBurst += 1;
+    if (state.stopTimeoutBurst >= TELEGRAM_POLL_STOP_TIMEOUT_BURST_LIMIT) {
+      state.stopTimeoutCooldownAttempts += 1;
+      const cooldownMs = computeBackoff(
+        TELEGRAM_POLL_STOP_TIMEOUT_COOLDOWN_POLICY,
+        state.stopTimeoutCooldownAttempts,
+      );
+      delayMs = Math.max(delayMs, cooldownMs);
+      stopTimeoutSuffix = ` Stop timeout burst=${state.stopTimeoutBurst}; applying cooldown.`;
+    }
+  } else {
+    state.stopTimeoutBurst = 0;
+    state.stopTimeoutCooldownAttempts = 0;
+  }
+  return { delayMs, stopTimeoutSuffix };
+}
 
 const DEFAULT_POLL_STALL_THRESHOLD_MS = 120_000;
 const MIN_POLL_STALL_THRESHOLD_MS = 30_000;
@@ -48,14 +116,41 @@ const MAX_POLL_STALL_THRESHOLD_MS = 600_000;
 const POLL_WATCHDOG_INTERVAL_MS = 30_000;
 const POLL_STOP_GRACE_MS = 15_000;
 const ISOLATED_INGRESS_BACKLOG_STALL_MS = 25 * 60_000;
+const TELEGRAM_SPOOLED_HANDLER_ABORT_GRACE_MS = 5_000;
+const TELEGRAM_SPOOLED_HANDLER_TIMEOUT_ENV = "OPENCLAW_TELEGRAM_SPOOLED_HANDLER_TIMEOUT_MS";
 const TELEGRAM_SPOOLED_DRAIN_START_LIMIT = 100;
 const TELEGRAM_SPOOLED_DRAIN_SCAN_LIMIT = TELEGRAM_SPOOLED_DRAIN_START_LIMIT * 10;
 const TELEGRAM_POLLING_CLIENT_TIMEOUT_FLOOR_SECONDS = Math.ceil(
   TELEGRAM_GET_UPDATES_REQUEST_TIMEOUT_MS / 1000,
 );
+const MISSING_AGENT_HARNESS_ERROR_NAME = "MissingAgentHarnessError";
+const MISSING_AGENT_HARNESS_MESSAGE_RE = /Requested agent harness "[^"]+" is not registered\./u;
 
 function normalizeTelegramAccountId(accountId?: string | null): string {
   return accountId?.trim() || "default";
+}
+
+type NonRetryableSpooledUpdateFailure = {
+  reason: "missing-agent-harness";
+  message: string;
+};
+
+function resolveNonRetryableSpooledUpdateFailure(
+  err: unknown,
+): NonRetryableSpooledUpdateFailure | null {
+  for (const candidate of collectErrorGraphCandidates(err, (current) => [
+    current.cause,
+    current.error,
+  ])) {
+    const message = formatErrorMessage(candidate);
+    if (
+      readErrorName(candidate) === MISSING_AGENT_HARNESS_ERROR_NAME ||
+      MISSING_AGENT_HARNESS_MESSAGE_RE.test(message)
+    ) {
+      return { reason: "missing-agent-harness", message };
+    }
+  }
+  return null;
 }
 
 type TelegramBot = ReturnType<typeof createTelegramBot>;
@@ -74,6 +169,38 @@ const waitForGracefulStop = async (stop: () => Promise<void>) => {
     if (timer) {
       clearTimeout(timer);
     }
+  }
+};
+
+const waitForSpooledHandlerTaskSettlement = async (params: {
+  task: Promise<unknown>;
+  timeoutMs: number;
+  abortSignal?: AbortSignal;
+}): Promise<boolean> => {
+  if (params.abortSignal?.aborted) {
+    return false;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let removeAbortListener: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      params.task.then(
+        () => true,
+        () => true,
+      ),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), params.timeoutMs);
+        timer.unref?.();
+        const abort = () => resolve(false);
+        params.abortSignal?.addEventListener("abort", abort, { once: true });
+        removeAbortListener = () => params.abortSignal?.removeEventListener("abort", abort);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+    removeAbortListener?.();
   }
 };
 
@@ -115,6 +242,8 @@ type TelegramPollingSessionOpts = {
     spoolDir?: string;
     createWorker?: TelegramIngressWorkerFactory;
     drainIntervalMs?: number;
+    spooledUpdateHandlerTimeoutMs?: number;
+    spooledUpdateHandlerAbortGraceMs?: number;
   };
 };
 
@@ -122,8 +251,11 @@ type SpooledUpdateHandlerState = {
   handlerKey: string;
   laneKey: string;
   task: Promise<boolean>;
+  update: ClaimedTelegramSpooledUpdate;
   updateId: number;
   startedAt: number;
+  timedOutAt?: number;
+  timeoutMessage?: string;
 };
 
 type SpooledUpdateDrainResult = {
@@ -135,6 +267,23 @@ type SpooledUpdateDrainResult = {
 // spooled handler may still be running after shutdown grace.
 const activeSpooledUpdateHandlersByLane = new Map<string, SpooledUpdateHandlerState>();
 
+function resolveSpooledUpdateHandlerTimeoutMs(params: {
+  configured?: number;
+  env?: NodeJS.ProcessEnv;
+}): number {
+  const candidates = [
+    params.configured,
+    Number(params.env?.[TELEGRAM_SPOOLED_HANDLER_TIMEOUT_ENV]),
+  ];
+  for (const candidate of candidates) {
+    const timeoutMs = clampPositiveTimerTimeoutMs(candidate);
+    if (timeoutMs !== undefined) {
+      return timeoutMs;
+    }
+  }
+  return ISOLATED_INGRESS_BACKLOG_STALL_MS;
+}
+
 function buildSpooledUpdateHandlerKey(params: { spoolDir: string; laneKey: string }): string {
   return `${params.spoolDir}\0${params.laneKey}`;
 }
@@ -144,7 +293,7 @@ function isSpooledUpdateHandlerKeyForSpool(handlerKey: string, spoolDir: string)
 }
 
 export class TelegramPollingSession {
-  #restartAttempts = 0;
+  #restartBackoffState = createTelegramRestartBackoffState();
   #webhookCleared = false;
   #forceRestarted = false;
   #activeRunner: ReturnType<typeof run> | undefined;
@@ -153,6 +302,8 @@ export class TelegramPollingSession {
   #transportState: TelegramPollingTransportState;
   #status: ReturnType<typeof createTelegramPollingStatusPublisher>;
   #stallThresholdMs: number;
+  #spooledUpdateHandlerTimeoutMs: number;
+  #spooledUpdateHandlerAbortGraceMs: number;
   #deliveryDrainInFlight = false;
 
   constructor(private readonly opts: TelegramPollingSessionOpts) {
@@ -163,6 +314,16 @@ export class TelegramPollingSession {
     });
     this.#status = createTelegramPollingStatusPublisher(opts.setStatus);
     this.#stallThresholdMs = resolvePollingStallThresholdMs(opts.stallThresholdMs);
+    this.#spooledUpdateHandlerTimeoutMs = resolveSpooledUpdateHandlerTimeoutMs({
+      ...(opts.isolatedIngress?.spooledUpdateHandlerTimeoutMs !== undefined
+        ? { configured: opts.isolatedIngress.spooledUpdateHandlerTimeoutMs }
+        : {}),
+      env: process.env,
+    });
+    this.#spooledUpdateHandlerAbortGraceMs = resolvePositiveTimerTimeoutMs(
+      opts.isolatedIngress?.spooledUpdateHandlerAbortGraceMs,
+      TELEGRAM_SPOOLED_HANDLER_ABORT_GRACE_MS,
+    );
   }
 
   get activeRunner() {
@@ -214,11 +375,20 @@ export class TelegramPollingSession {
     }
   }
 
-  async #waitBeforeRestart(buildLine: (delay: string) => string): Promise<boolean> {
-    this.#restartAttempts += 1;
-    const delayMs = computeBackoff(TELEGRAM_POLL_RESTART_POLICY, this.#restartAttempts);
+  #noteHealthyPollingCycle() {
+    resetTelegramRestartBackoffState(this.#restartBackoffState);
+  }
+
+  async #waitBeforeRestart(
+    buildLine: (delay: string) => string,
+    opts: { stopTimedOut?: boolean } = {},
+  ): Promise<boolean> {
+    const { delayMs, stopTimeoutSuffix } = resolveTelegramRestartDelayMs(
+      this.#restartBackoffState,
+      opts,
+    );
     const delay = formatDurationPrecise(delayMs);
-    this.opts.log(buildLine(delay));
+    this.opts.log(`${buildLine(delay)}${stopTimeoutSuffix}`);
     try {
       await sleepWithAbort(delayMs, this.opts.abortSignal);
     } catch (sleepErr) {
@@ -267,7 +437,7 @@ export class TelegramPollingSession {
         bypassBackoff: false,
       }),
     })
-      .catch((err) => {
+      .catch((err: unknown) => {
         this.opts.log(`[telegram] reconnect delivery drain failed: ${formatErrorMessage(err)}`);
       })
       .finally(() => {
@@ -279,12 +449,13 @@ export class TelegramPollingSession {
     const fetchAbortController = new AbortController();
     this.#activeFetchAbort = fetchAbortController;
     const telegramTransport = this.#transportState.acquireForNextCycle();
-    const updateOffset = this.opts.isolatedIngress?.enabled
-      ? undefined
-      : {
-          lastUpdateId: this.opts.getLastUpdateId(),
-          onUpdateId: this.opts.persistUpdateId,
-        };
+    const persistedLastUpdateId = this.opts.getLastUpdateId();
+    const lastUpdateId = this.opts.isolatedIngress?.enabled ? null : persistedLastUpdateId;
+    const updateOffset = {
+      lastUpdateId,
+      persistenceFloorUpdateId: persistedLastUpdateId,
+      onUpdateId: this.opts.persistUpdateId,
+    };
     try {
       return createTelegramBot({
         token: this.opts.token,
@@ -377,6 +548,30 @@ export class TelegramPollingSession {
     err: unknown;
     update: ClaimedTelegramSpooledUpdate;
   }): Promise<void> {
+    const nonRetryable = resolveNonRetryableSpooledUpdateFailure(params.err);
+    if (nonRetryable) {
+      try {
+        const failed = await failTelegramSpooledUpdateClaim({
+          update: params.update,
+          reason: nonRetryable.reason,
+          message: nonRetryable.message,
+        });
+        if (!failed) {
+          this.opts.log(
+            `[telegram][diag] spooled update ${params.update.updateId} failed with non-retryable ${nonRetryable.reason}, but no processing marker remained to dead-letter.`,
+          );
+          return;
+        }
+        this.opts.log(
+          `[telegram][diag] spooled update ${params.update.updateId} failed with non-retryable ${nonRetryable.reason}; dead-lettered: ${nonRetryable.message}`,
+        );
+        return;
+      } catch (failErr) {
+        this.opts.log(
+          `[telegram][diag] spooled update ${params.update.updateId} failed with non-retryable ${nonRetryable.reason}, but could not be dead-lettered: ${formatErrorMessage(failErr)}`,
+        );
+      }
+    }
     try {
       await releaseTelegramSpooledUpdateClaim(params.update);
     } catch (releaseErr) {
@@ -466,6 +661,7 @@ export class TelegramPollingSession {
         handlerKey,
         laneKey,
         task: handler,
+        update: claimedUpdate,
         updateId: update.updateId,
         startedAt: Date.now(),
       };
@@ -486,25 +682,95 @@ export class TelegramPollingSession {
     return { blockedByLane, started };
   }
 
-  #detectStaleSpooledHandler(
+  #detectTimedOutSpooledHandler(
     blockedHandlerKeys: Set<string>,
-  ): (SpooledUpdateHandlerState & { ageMs: number }) | null {
+  ): { handler: SpooledUpdateHandlerState; ageMs: number } | null {
     const now = Date.now();
-    let stale: (SpooledUpdateHandlerState & { ageMs: number }) | null = null;
+    let timedOut: { handler: SpooledUpdateHandlerState; ageMs: number } | null = null;
     for (const handlerKey of blockedHandlerKeys) {
       const handler = activeSpooledUpdateHandlersByLane.get(handlerKey);
-      if (!handler) {
+      if (!handler || handler.timedOutAt !== undefined) {
         continue;
       }
       const ageMs = now - handler.startedAt;
-      if (ageMs <= ISOLATED_INGRESS_BACKLOG_STALL_MS) {
+      if (ageMs < this.#spooledUpdateHandlerTimeoutMs) {
         continue;
       }
-      if (!stale || ageMs > stale.ageMs) {
-        stale = { ...handler, ageMs };
+      if (!timedOut || ageMs > timedOut.ageMs) {
+        timedOut = { handler, ageMs };
       }
     }
-    return stale;
+    return timedOut;
+  }
+
+  async #recoverTimedOutSpooledHandler(
+    blockedHandlerKeys: Set<string>,
+  ): Promise<{ handlerKey: string; restart: boolean } | null> {
+    const timedOutHandler = this.#detectTimedOutSpooledHandler(blockedHandlerKeys);
+    if (!timedOutHandler) {
+      return null;
+    }
+    const handler = timedOutHandler.handler;
+    const activeHandler = activeSpooledUpdateHandlersByLane.get(handler.handlerKey);
+    if (!activeHandler || activeHandler !== handler) {
+      return null;
+    }
+    const age = formatDurationPrecise(timedOutHandler.ageMs);
+    activeHandler.timedOutAt = Date.now();
+    const message = `Telegram isolated polling spool handler timed out behind update ${handler.updateId} on lane ${handler.laneKey} after ${age}; marking the update failed, aborting active reply work, and restarting isolated ingress so later updates can drain.`;
+    activeHandler.timeoutMessage = message;
+    try {
+      const failed = await failTelegramSpooledUpdateClaim({
+        update: handler.update,
+        reason: "handler-timeout",
+        message,
+      });
+      if (!failed) {
+        this.opts.log(
+          `[telegram][diag] timed out spooled update ${handler.updateId} no longer had a processing marker to fail.`,
+        );
+        this.#status.notePollingError(message);
+        return { handlerKey: handler.handlerKey, restart: false };
+      }
+    } catch (err) {
+      this.opts.log(
+        `[telegram][diag] timed out spooled update ${handler.updateId} could not be marked failed: ${formatErrorMessage(err)}`,
+      );
+      this.#status.notePollingError(message);
+      return { handlerKey: handler.handlerKey, restart: false };
+    }
+    const scopedReplyFenceLaneKey = buildTelegramReplyFenceLaneKey({
+      accountId: this.opts.accountId,
+      sequentialKey: handler.laneKey,
+    });
+    const abortedReplyWork = supersedeTelegramReplyFenceLane(scopedReplyFenceLaneKey);
+    if (!abortedReplyWork) {
+      this.opts.log(
+        `[telegram][diag] timed out spooled update ${handler.updateId} had no active reply fence on lane ${handler.laneKey}; keeping the lane guarded until the handler stops.`,
+      );
+    }
+    const handlerStopped = await waitForSpooledHandlerTaskSettlement({
+      task: handler.task,
+      timeoutMs: this.#spooledUpdateHandlerAbortGraceMs,
+      abortSignal: this.opts.abortSignal,
+    });
+    if (
+      !handlerStopped &&
+      activeSpooledUpdateHandlersByLane.get(handler.handlerKey) === activeHandler
+    ) {
+      this.opts.log(
+        `[telegram][diag] timed out spooled update ${handler.updateId} did not stop within ${formatDurationPrecise(this.#spooledUpdateHandlerAbortGraceMs)} after reply abort; keeping lane ${handler.laneKey} guarded.`,
+      );
+      this.#status.notePollingError(message);
+      return { handlerKey: handler.handlerKey, restart: false };
+    }
+    if (activeSpooledUpdateHandlersByLane.get(handler.handlerKey) === activeHandler) {
+      activeSpooledUpdateHandlersByLane.delete(handler.handlerKey);
+    }
+    this.#spooledUpdateHandlerKeys.delete(handler.handlerKey);
+    this.opts.log(`[telegram] ${message}`);
+    this.#status.notePollingError(message);
+    return { handlerKey: handler.handlerKey, restart: true };
   }
 
   async #runIsolatedIngressCycle(bot: TelegramBot): Promise<"continue" | "exit"> {
@@ -534,6 +800,13 @@ export class TelegramPollingSession {
       network: ingress.network,
       proxy: ingress.proxy,
     });
+    let stopWorkerPromise: Promise<void> | undefined;
+    const stopWorker = () => {
+      stopWorkerPromise ??= Promise.resolve(worker.stop())
+        .then(() => undefined)
+        .catch(() => undefined);
+      return stopWorkerPromise;
+    };
     this.opts.log(`[telegram][diag] isolated polling ingress started spool=${spoolDir}`);
     const pollState: {
       startedAt: number | null;
@@ -545,10 +818,37 @@ export class TelegramPollingSession {
       offset: null,
       outcome: "not-started",
     };
+    const liveness = new TelegramPollingLivenessTracker();
     let consecutiveDrainFailures = 0;
+    let restartRequested = false;
+    let stalledRestart = false;
+    let stopTimedOut = false;
+    let forceCycleTimer: ReturnType<typeof setTimeout> | undefined;
+    let forceCycleResolve: (() => void) | undefined;
+    const forceCyclePromise = new Promise<void>((resolve) => {
+      forceCycleResolve = resolve;
+    });
     const stalledBacklogKeys = new Set<string>();
     const unsubscribe = worker.onMessage((message) => {
+      const ackSpooledUpdate = (
+        requestId: string,
+        result:
+          | { ok: true; updateId: number }
+          | {
+              ok: false;
+              message: string;
+            },
+      ): void => {
+        try {
+          worker.ackSpooledUpdate?.(requestId, result);
+        } catch (err) {
+          this.opts.log(
+            `[telegram][diag] isolated polling worker ack failed: ${formatErrorMessage(err)}`,
+          );
+        }
+      };
       if (message.type === "poll-start") {
+        liveness.noteGetUpdatesStarted({ offset: message.offset }, message.startedAt);
         pollState.startedAt = message.startedAt;
         pollState.offset = message.offset;
         pollState.outcome = "started";
@@ -556,7 +856,10 @@ export class TelegramPollingSession {
         return;
       }
       if (message.type === "poll-success") {
-        if (stalledBacklogKeys.size === 0) {
+        liveness.noteGetUpdatesSuccessCount(message.count, message.finishedAt);
+        liveness.noteGetUpdatesFinished();
+        this.#noteHealthyPollingCycle();
+        if (!restartRequested && stalledBacklogKeys.size === 0) {
           this.#status.notePollSuccess(message.finishedAt);
         }
         this.#drainPendingDeliveriesAfterReconnect();
@@ -564,12 +867,35 @@ export class TelegramPollingSession {
         return;
       }
       if (message.type === "poll-error") {
+        liveness.noteGetUpdatesError(new Error(message.message), message.finishedAt);
+        liveness.noteGetUpdatesFinished();
         pollState.outcome = "error";
         pollState.error = message.message;
+        return;
+      }
+      if (message.type === "update") {
+        void writeTelegramSpooledUpdate({
+          spoolDir,
+          update: message.update,
+        }).then(
+          (updateId) => {
+            ackSpooledUpdate(message.requestId, { ok: true, updateId });
+          },
+          (err: unknown) => {
+            ackSpooledUpdate(message.requestId, {
+              ok: false,
+              message: formatErrorMessage(err),
+            });
+          },
+        );
+        return;
+      }
+      if (message.type === "spooled") {
+        liveness.noteGetUpdatesActivity();
       }
     });
     const stopOnAbort = () => {
-      void worker.stop();
+      void stopWorker();
     };
     this.opts.abortSignal?.addEventListener("abort", stopOnAbort, { once: true });
     const drainIntervalMs = Math.max(100, Math.floor(ingress.drainIntervalMs ?? 500));
@@ -577,12 +903,36 @@ export class TelegramPollingSession {
     const stopBot = () => {
       return Promise.resolve(bot.stop())
         .then(() => undefined)
-        .catch(() => {
-          // Bot may already be stopped by shutdown paths.
-        });
+        .catch(() => undefined);
+    };
+    const clearForceCycleTimer = () => {
+      if (!forceCycleTimer) {
+        return;
+      }
+      clearTimeout(forceCycleTimer);
+      forceCycleTimer = undefined;
+    };
+    const requestStopForRestart = () => {
+      if (restartRequested) {
+        return;
+      }
+      restartRequested = true;
+      void stopWorker();
+      if (!forceCycleTimer) {
+        forceCycleTimer = setTimeout(() => {
+          if (this.opts.abortSignal?.aborted) {
+            return;
+          }
+          this.opts.log(
+            `[telegram] Isolated polling ingress stop timed out after ${formatDurationPrecise(POLL_STOP_GRACE_MS)}; forcing restart cycle.`,
+          );
+          stopTimedOut = true;
+          forceCycleResolve?.();
+        }, POLL_STOP_GRACE_MS);
+      }
     };
     const drainOnce = async () => {
-      if (drainActive || this.opts.abortSignal?.aborted) {
+      if (restartRequested || drainActive || this.opts.abortSignal?.aborted) {
         return;
       }
       drainActive = true;
@@ -597,14 +947,21 @@ export class TelegramPollingSession {
             stalledBacklogKeys.delete(handlerKey);
           }
         }
-        const staleHandler = this.#detectStaleSpooledHandler(drain.blockedByLane);
-        if (staleHandler) {
-          if (!stalledBacklogKeys.has(staleHandler.handlerKey)) {
-            stalledBacklogKeys.add(staleHandler.handlerKey);
-            const message = `Telegram isolated polling spool backlog stalled behind update ${staleHandler.updateId} on lane ${staleHandler.laneKey} for ${formatDurationPrecise(staleHandler.ageMs)}; marking polling unhealthy until the backlog drains.`;
-            this.opts.log(`[telegram] ${message}`);
-            this.#status.notePollingError(message);
+        for (const handlerKey of drain.blockedByLane) {
+          const handler = activeSpooledUpdateHandlersByLane.get(handlerKey);
+          if (handler?.timedOutAt === undefined) {
+            continue;
           }
+          stalledBacklogKeys.add(handlerKey);
+          if (handler.timeoutMessage) {
+            this.#status.notePollingError(handler.timeoutMessage);
+          }
+        }
+        const timedOutRecovery = await this.#recoverTimedOutSpooledHandler(drain.blockedByLane);
+        if (timedOutRecovery?.restart) {
+          requestStopForRestart();
+        } else if (timedOutRecovery) {
+          stalledBacklogKeys.add(timedOutRecovery.handlerKey);
         }
       } catch (err) {
         consecutiveDrainFailures += 1;
@@ -620,10 +977,61 @@ export class TelegramPollingSession {
       void drainOnce();
     }, drainIntervalMs);
     drainTimer.unref?.();
+    const watchdog = setInterval(() => {
+      if (this.opts.abortSignal?.aborted || restartRequested) {
+        return;
+      }
+      const stall = liveness.detectStall({
+        thresholdMs: this.#stallThresholdMs,
+      });
+      if (!stall) {
+        return;
+      }
+      this.#transportState.markDirty();
+      stalledRestart = true;
+      this.opts.log(`[telegram] ${stall.message}`);
+      this.#status.notePollingError(stall.message);
+      requestStopForRestart();
+    }, POLL_WATCHDOG_INTERVAL_MS);
+    watchdog.unref?.();
     try {
-      await worker.task();
+      try {
+        await Promise.race([worker.task(), forceCyclePromise]);
+        clearForceCycleTimer();
+      } catch (err) {
+        if (this.opts.abortSignal?.aborted) {
+          return "exit";
+        }
+        if (
+          pollState.error &&
+          !isRecoverableTelegramNetworkError(new Error(pollState.error), { context: "polling" })
+        ) {
+          this.#status.notePollingError(pollState.error);
+          throw new Error(pollState.error, { cause: err });
+        }
+        const message = formatErrorMessage(err);
+        this.opts.log(`[telegram][diag] isolated polling ingress failed: ${message}`);
+        this.#status.notePollingError(message);
+        clearForceCycleTimer();
+        const shouldRestart = await this.#waitBeforeRestart(
+          (delay) => `Telegram isolated polling ingress failed; restarting in ${delay}.`,
+        );
+        return shouldRestart ? "continue" : "exit";
+      }
       if (this.opts.abortSignal?.aborted) {
         return "exit";
+      }
+      if (restartRequested) {
+        if (stalledRestart) {
+          this.opts.log(
+            `[telegram][diag] isolated polling ingress finished reason=polling stall detected ${liveness.formatDiagnosticFields("error")}`,
+          );
+        }
+        const shouldRestart = await this.#waitBeforeRestart(
+          (delay) => `Telegram isolated polling ingress restart requested; restarting in ${delay}.`,
+          { stopTimedOut },
+        );
+        return shouldRestart ? "continue" : "exit";
       }
       const errorText = pollState.error ? ` error=${pollState.error}` : "";
       this.opts.log(
@@ -634,12 +1042,16 @@ export class TelegramPollingSession {
       );
       return shouldRestart ? "continue" : "exit";
     } finally {
+      clearInterval(watchdog);
       clearInterval(drainTimer);
+      clearForceCycleTimer();
       unsubscribe();
       this.opts.abortSignal?.removeEventListener("abort", stopOnAbort);
-      await worker.stop();
-      await drainOnce();
-      await waitForGracefulStop(() => this.#waitForSpooledUpdateHandlers());
+      await stopWorker();
+      if (!restartRequested) {
+        await drainOnce();
+        await waitForGracefulStop(() => this.#waitForSpooledUpdateHandlers());
+      }
       await waitForGracefulStop(stopBot);
     }
   }
@@ -647,6 +1059,7 @@ export class TelegramPollingSession {
   async #runPollingCycle(bot: TelegramBot): Promise<"continue" | "exit"> {
     const liveness = new TelegramPollingLivenessTracker({
       onPollSuccess: (finishedAt) => {
+        this.#noteHealthyPollingCycle();
         this.#status.notePollSuccess(finishedAt);
         this.#drainPendingDeliveriesAfterReconnect();
       },
@@ -687,21 +1100,26 @@ export class TelegramPollingSession {
     const forceCyclePromise = new Promise<void>((resolve) => {
       forceCycleResolve = resolve;
     });
+    const clearForceCycleTimer = () => {
+      if (!forceCycleTimer) {
+        return;
+      }
+      clearTimeout(forceCycleTimer);
+      forceCycleTimer = undefined;
+    };
     const stopRunner = () => {
       fetchAbortController?.abort();
       stopPromise ??= Promise.resolve(runner.stop())
         .then(() => undefined)
-        .catch(() => {
-          // Runner may already be stopped by abort/retry paths.
-        });
+        .catch(() => undefined);
       return stopPromise;
     };
+    let stopBotPromise: Promise<void> | undefined;
     const stopBot = () => {
-      return Promise.resolve(bot.stop())
+      stopBotPromise ??= Promise.resolve(bot.stop())
         .then(() => undefined)
-        .catch(() => {
-          // Bot may already be stopped by runner stop/abort paths.
-        });
+        .catch(() => undefined);
+      return stopBotPromise;
     };
     const stopOnAbort = () => {
       if (this.opts.abortSignal?.aborted) {
@@ -709,8 +1127,31 @@ export class TelegramPollingSession {
       }
     };
 
+    let restartRequested = false;
+    let stopTimedOut = false;
+    const requestStopForRestart = () => {
+      if (restartRequested) {
+        return;
+      }
+      restartRequested = true;
+      void stopRunner();
+      void stopBot();
+      if (!forceCycleTimer) {
+        forceCycleTimer = setTimeout(() => {
+          if (this.opts.abortSignal?.aborted) {
+            return;
+          }
+          this.opts.log(
+            `[telegram] Polling runner stop timed out after ${formatDurationPrecise(POLL_STOP_GRACE_MS)}; forcing restart cycle.`,
+          );
+          stopTimedOut = true;
+          forceCycleResolve?.();
+        }, POLL_STOP_GRACE_MS);
+      }
+    };
+
     const watchdog = setInterval(() => {
-      if (this.opts.abortSignal?.aborted) {
+      if (this.opts.abortSignal?.aborted || restartRequested) {
         return;
       }
 
@@ -721,25 +1162,14 @@ export class TelegramPollingSession {
         this.#transportState.markDirty();
         stalledRestart = true;
         this.opts.log(`[telegram] ${stall.message}`);
-        void stopRunner();
-        void stopBot();
-        if (!forceCycleTimer) {
-          forceCycleTimer = setTimeout(() => {
-            if (this.opts.abortSignal?.aborted) {
-              return;
-            }
-            this.opts.log(
-              `[telegram] Polling runner stop timed out after ${formatDurationPrecise(POLL_STOP_GRACE_MS)}; forcing restart cycle.`,
-            );
-            forceCycleResolve?.();
-          }, POLL_STOP_GRACE_MS);
-        }
+        requestStopForRestart();
       }
     }, POLL_WATCHDOG_INTERVAL_MS);
 
     this.opts.abortSignal?.addEventListener("abort", stopOnAbort, { once: true });
     try {
       await Promise.race([runner.task(), forceCyclePromise]);
+      clearForceCycleTimer();
       if (this.opts.abortSignal?.aborted) {
         return "exit";
       }
@@ -754,6 +1184,7 @@ export class TelegramPollingSession {
       );
       const shouldRestart = await this.#waitBeforeRestart(
         (delay) => `Telegram polling runner stopped (${reason}); restarting in ${delay}.`,
+        { stopTimedOut },
       );
       return shouldRestart ? "continue" : "exit";
     } catch (err) {
@@ -785,15 +1216,14 @@ export class TelegramPollingSession {
       this.opts.log(
         `[telegram][diag] polling cycle error reason=${reason} ${liveness.formatDiagnosticFields("lastGetUpdatesError")} err=${errMsg}${conflictHint}`,
       );
+      clearForceCycleTimer();
       const shouldRestart = await this.#waitBeforeRestart(
         (delay) => `Telegram ${reason}: ${errMsg};${conflictHint} retrying in ${delay}.`,
       );
       return shouldRestart ? "continue" : "exit";
     } finally {
       clearInterval(watchdog);
-      if (forceCycleTimer) {
-        clearTimeout(forceCycleTimer);
-      }
+      clearForceCycleTimer();
       this.opts.abortSignal?.removeEventListener("abort", abortFetch);
       this.opts.abortSignal?.removeEventListener("abort", stopOnAbort);
       await waitForGracefulStop(stopRunner);
@@ -826,4 +1256,15 @@ const isGetUpdatesConflict = (err: unknown) => {
     .join(" ");
   const normalizedHaystack = normalizeLowercaseStringOrEmpty(haystack);
   return normalizedHaystack.includes("getupdates");
+};
+
+export const testing = {
+  resetActiveSpooledUpdateHandlersForTests: (): void => {
+    activeSpooledUpdateHandlersByLane.clear();
+  },
+  createTelegramRestartBackoffState,
+  resetTelegramRestartBackoffState,
+  resolveTelegramRestartDelayMs,
+  resolveSpooledUpdateHandlerAbortGraceMs: (valueMs: unknown): number =>
+    resolvePositiveTimerTimeoutMs(valueMs, TELEGRAM_SPOOLED_HANDLER_ABORT_GRACE_MS),
 };

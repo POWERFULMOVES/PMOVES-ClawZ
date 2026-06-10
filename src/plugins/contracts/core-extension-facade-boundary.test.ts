@@ -1,8 +1,10 @@
-import { spawnSync } from "node:child_process";
+// Core extension facade boundary tests cover allowed imports between core and extension facades.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { expectNoReaddirSyncDuring } from "../../test-utils/fs-scan-assertions.js";
+import { listGitTrackedFiles, toRepoRelativePath } from "../../test-utils/repo-files.js";
 
 const repoRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const srcRoot = path.join(repoRoot, "src");
@@ -25,23 +27,18 @@ const importSpecifierPattern =
   /\b(?:import|export)\s+(?:type\s+)?(?:[^'"]*?\s+from\s+)?["']([^"']+)["']|import\(\s*["']([^"']+)["']\s*\)/g;
 
 function listTrackedSourceFiles(dir: string): string[] | null {
-  const relativeDir = path.relative(repoRoot, dir).split(path.sep).join("/");
+  const relativeDir = toRepoRelativePath(repoRoot, dir);
   if (!relativeDir || relativeDir.startsWith("..")) {
     return null;
   }
-  const result = spawnSync("git", ["ls-files", "--", relativeDir], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0) {
+  const files = listGitTrackedFiles({ repoRoot, pathspecs: relativeDir });
+  if (!files) {
     return null;
   }
-  return result.stdout
-    .split("\n")
-    .map((line) => line.trim().replaceAll("\\", "/"))
+  return files
     .filter((line) => line.length > 0 && line.endsWith(".ts") && !line.includes("/plugin-sdk/"))
     .map((line) => path.join(repoRoot, ...line.split("/")))
+    .filter((filePath) => fs.existsSync(filePath))
     .toSorted();
 }
 
@@ -69,21 +66,32 @@ function collectSourceFiles(dir: string, files: string[] = []): string[] {
 }
 
 function toRepoRelative(filePath: string): string {
-  return path.relative(repoRoot, filePath).split(path.sep).join("/");
+  return toRepoRelativePath(repoRoot, filePath);
 }
 
 describe("core extension facade boundary", () => {
+  let ollamaCoreImportViolations: string[];
+
+  beforeAll(() => {
+    ollamaCoreImportViolations = [];
+    for (const filePath of collectSourceFiles(srcRoot)) {
+      const source = fs.readFileSync(filePath, "utf8");
+      for (const match of source.matchAll(importSpecifierPattern)) {
+        const specifier = match[1] ?? match[2];
+        if (specifier?.includes("plugin-sdk/ollama")) {
+          ollamaCoreImportViolations.push(`${toRepoRelative(filePath)} -> ${specifier}`);
+        }
+      }
+    }
+  });
+
   it("lists core facade boundary sources from git without walking src", () => {
-    const readDir = vi.spyOn(fs, "readdirSync");
-    try {
+    expectNoReaddirSyncDuring(() => {
       const files = collectSourceFiles(srcRoot);
 
       expect(files.length).toBeGreaterThan(0);
       expect(files.some((file) => file.includes("/plugin-sdk/"))).toBe(false);
-      expect(readDir).not.toHaveBeenCalled();
-    } finally {
-      readDir.mockRestore();
-    }
+    });
   });
 
   it("does not expose Ollama plugin facades from core plugin-sdk", () => {
@@ -93,18 +101,7 @@ describe("core extension facade boundary", () => {
   });
 
   it("does not import Ollama plugin facades from core code", () => {
-    const violations: string[] = [];
-    for (const filePath of collectSourceFiles(srcRoot)) {
-      const source = fs.readFileSync(filePath, "utf8");
-      for (const match of source.matchAll(importSpecifierPattern)) {
-        const specifier = match[1] ?? match[2];
-        if (specifier?.includes("plugin-sdk/ollama")) {
-          violations.push(`${toRepoRelative(filePath)} -> ${specifier}`);
-        }
-      }
-    }
-
-    expect(violations).toStrictEqual([]);
+    expect(ollamaCoreImportViolations).toStrictEqual([]);
   });
 
   it("keeps generic core fixtures free of bundled provider names", () => {

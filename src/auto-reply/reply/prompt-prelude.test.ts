@@ -1,3 +1,4 @@
+// Tests prompt prelude construction for sender, routing, and context metadata.
 import { describe, expect, it } from "vitest";
 import { finalizeInboundContext } from "./inbound-context.js";
 import { buildReplyPromptEnvelope } from "./prompt-prelude.js";
@@ -26,7 +27,7 @@ describe("buildReplyPromptEnvelope", () => {
     expect(envelope.prefixedCommandBody).toContain("sender_id=telegram-user-1");
     expect(envelope.prefixedCommandBody).toContain("Startup context");
     expect(envelope.transcriptCommandBody).toBe("[OpenClaw session reset]");
-    expect(envelope.currentTurnContext).toBeUndefined();
+    expect(envelope.currentInboundContext).toBeUndefined();
   });
 
   it("keeps ordinary inbound context runtime-only while preserving transcript text", () => {
@@ -51,7 +52,7 @@ describe("buildReplyPromptEnvelope", () => {
 
     expect(envelope.prefixedCommandBody).toBe("what changed?");
     expect(envelope.transcriptCommandBody).toBe("what changed?");
-    expect(envelope.currentTurnContext).toEqual({
+    expect(envelope.currentInboundContext).toEqual({
       text: "Current message:\nchat_id=C123",
       promptJoiner: " ",
     });
@@ -63,7 +64,7 @@ describe("buildReplyPromptEnvelope", () => {
       BodyStripped: "No wtf",
       Provider: "telegram",
       ChatType: "group",
-      InboundTurnKind: "room_event",
+      InboundEventKind: "room_event",
       MessageSid: "35676",
       SenderName: "Keśava",
     });
@@ -76,7 +77,7 @@ describe("buildReplyPromptEnvelope", () => {
       inboundUserContext: [
         "Conversation info (untrusted metadata):",
         "```json",
-        JSON.stringify({ message_id: "35676", turn_kind: "room_event" }, null, 2),
+        JSON.stringify({ message_id: "35676", inbound_event_kind: "room_event" }, null, 2),
         "```",
         "",
         "Conversation context (untrusted, chronological, selected for current message):",
@@ -85,22 +86,21 @@ describe("buildReplyPromptEnvelope", () => {
       ].join("\n"),
       isBareSessionReset: false,
       startupAction: "new",
-      turnKind: "room_event",
+      inboundEventKind: "room_event",
     });
 
     expect(envelope.prefixedCommandBody).toBe("[OpenClaw room event]");
     expect(envelope.queuedBody).toBe("[OpenClaw room event]");
     expect(envelope.transcriptCommandBody).toBe("");
-    expect(envelope.currentTurnContext?.text).toBe(
+    expect(envelope.currentInboundContext?.text).toBe(
       [
-        "[OpenClaw turn]",
-        "kind: room_event",
-        "visible_reply_contract: message_tool_only",
+        "[OpenClaw room event]",
+        "inbound_event_kind: room_event",
         [
           "Room context:",
           "Conversation info (untrusted metadata):",
           "```json",
-          JSON.stringify({ message_id: "35676", turn_kind: "room_event" }, null, 2),
+          JSON.stringify({ message_id: "35676", inbound_event_kind: "room_event" }, null, 2),
           "```",
           "",
           "Conversation context (untrusted, chronological, selected for current message):",
@@ -110,6 +110,24 @@ describe("buildReplyPromptEnvelope", () => {
         "Current event:\n#35676 Keśava: No wtf",
         "Treat this as observed room activity. Decide whether to act.",
       ].join("\n\n"),
+    );
+    expect(envelope.currentInboundContext?.resumableText).toBe(
+      [
+        "[OpenClaw room event]",
+        "inbound_event_kind: room_event",
+        [
+          "Room context:",
+          "Conversation info (untrusted metadata):",
+          "```json",
+          JSON.stringify({ message_id: "35676", inbound_event_kind: "room_event" }, null, 2),
+          "```",
+        ].join("\n"),
+        "Current event:\n#35676 Keśava: No wtf",
+        "Treat this as observed room activity. Decide whether to act.",
+      ].join("\n\n"),
+    );
+    expect(envelope.currentInboundContext?.resumableText).not.toContain(
+      "Conversation context (untrusted, chronological, selected for current message):",
     );
   });
 
@@ -121,7 +139,7 @@ describe("buildReplyPromptEnvelope", () => {
       CommandBody: "current note",
       Provider: "telegram",
       ChatType: "group",
-      InboundTurnKind: "room_event",
+      InboundEventKind: "room_event",
       MessageSid: "2002",
       SenderName: "Bob",
     });
@@ -134,13 +152,15 @@ describe("buildReplyPromptEnvelope", () => {
       inboundUserContext: "Chat history since last reply:\nAlice: old context",
       isBareSessionReset: false,
       startupAction: "new",
-      turnKind: "room_event",
+      inboundEventKind: "room_event",
     });
 
-    expect(envelope.currentTurnContext?.text).toContain("Room context:");
-    expect(envelope.currentTurnContext?.text).toContain("Alice: old context");
-    expect(envelope.currentTurnContext?.text).toContain("Current event:\n#2002 Bob: current note");
-    expect(envelope.currentTurnContext?.text).not.toContain(
+    expect(envelope.currentInboundContext?.text).toContain("Room context:");
+    expect(envelope.currentInboundContext?.text).toContain("Alice: old context");
+    expect(envelope.currentInboundContext?.text).toContain(
+      "Current event:\n#2002 Bob: current note",
+    );
+    expect(envelope.currentInboundContext?.text).not.toContain(
       "Current event:\n#2002 Bob: [Chat history]",
     );
   });

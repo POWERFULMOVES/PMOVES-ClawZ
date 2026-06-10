@@ -1,3 +1,5 @@
+// End-to-end proxy smoke tests run child OpenClaw modules through a local
+// HTTP/HTTPS forward proxy, including Discord-style HTTP, TLS, and WebSocket paths.
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { createServer, request as httpRequest, type Server } from "node:http";
@@ -8,6 +10,7 @@ import type { Duplex } from "node:stream";
 import { afterEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
 import { withTempDir } from "../../../test-helpers/temp-dir.js";
+import { createNodeEvalArgs } from "../../../test-utils/node-process.js";
 import { resolveSystemBin } from "../../resolve-system-bin.js";
 import { resolvePreferredOpenClawTmpDir } from "../../tmp-openclaw-dir.js";
 
@@ -248,15 +251,11 @@ async function runNodeModule(
   stdout: string;
   stderr: string;
 }> {
-  const child = spawn(
-    process.execPath,
-    ["--import", "tsx", "--input-type=module", "--eval", source],
-    {
-      cwd: process.cwd(),
-      env,
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
+  const child = spawn(process.execPath, createNodeEvalArgs(source, { imports: ["tsx"] }), {
+    cwd: process.cwd(),
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 
   let stdout = "";
   let stderr = "";
