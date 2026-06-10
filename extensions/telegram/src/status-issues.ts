@@ -1,3 +1,4 @@
+// Telegram plugin module implements status issues behavior.
 import type {
   ChannelAccountSnapshot,
   ChannelStatusIssue,
@@ -70,7 +71,11 @@ function appendTelegramRuntimeError(message: string, lastError: unknown): string
 }
 
 function isTelegramPollingBacklogStallError(lastError: unknown): boolean {
-  return Boolean(asString(lastError)?.includes("isolated polling spool backlog stalled"));
+  const error = asString(lastError);
+  return Boolean(
+    error?.includes("isolated polling spool backlog stalled") ||
+    error?.includes("isolated polling spool handler timed out"),
+  );
 }
 
 function collectTelegramPollingRuntimeIssues(params: {

@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
+// Extension package boundary tests cover package/project boundaries for bundled extensions.
 import fs from "node:fs";
-import { relative, resolve } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { resolve } from "node:path";
+import { describe, expect, it } from "vitest";
 import {
   collectExtensionsWithTsconfig,
   collectOptInExtensionPackageBoundaries,
@@ -13,6 +13,8 @@ import {
   readExtensionPackageBoundaryPackageJson,
   readExtensionPackageBoundaryTsconfig,
 } from "../../../scripts/lib/extension-package-boundary.ts";
+import { expectNoReaddirSyncDuring } from "../../test-utils/fs-scan-assertions.js";
+import { listGitTrackedFiles, toRepoRelativePath } from "../../test-utils/repo-files.js";
 
 const REPO_ROOT = resolve(import.meta.dirname, "../../..");
 const EXTENSION_PACKAGE_BOUNDARY_PATHS_CONFIG =
@@ -81,19 +83,14 @@ function listTrackedCodeFiles(relativeDir: string): string[] | null {
     const files = trackedCodeFilesByRoot.get(relativeDir);
     return files ? [...files] : null;
   }
-  const result = spawnSync("git", ["ls-files", "--", relativeDir], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0) {
+  const trackedFiles = listGitTrackedFiles({ repoRoot: REPO_ROOT, pathspecs: relativeDir });
+  if (!trackedFiles) {
     trackedCodeFilesByRoot.set(relativeDir, null);
     return null;
   }
-  const files = result.stdout
-    .split("\n")
-    .map((line) => line.trim().replaceAll("\\", "/"))
+  const files = trackedFiles
     .filter((line) => line.length > 0 && /\.(?:[cm]?ts|tsx|mts|cts)$/u.test(line))
+    .filter((line) => fs.existsSync(resolve(REPO_ROOT, line)))
     .toSorted();
   trackedCodeFilesByRoot.set(relativeDir, files);
   return [...files];
@@ -110,11 +107,11 @@ function collectCodeFiles(relativeDir: string): string[] {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const nextPath = resolve(dir, entry.name);
     if (entry.isDirectory()) {
-      files.push(...collectCodeFiles(relative(REPO_ROOT, nextPath).replaceAll("\\", "/")));
+      files.push(...collectCodeFiles(toRepoRelativePath(REPO_ROOT, nextPath)));
       continue;
     }
     if (entry.isFile() && /\.(?:[cm]?ts|tsx|mts|cts)$/u.test(entry.name)) {
-      files.push(relative(REPO_ROOT, nextPath).replaceAll("\\", "/"));
+      files.push(toRepoRelativePath(REPO_ROOT, nextPath));
     }
   }
   return files.toSorted();
@@ -136,17 +133,13 @@ function collectOpenClawRuntimeDirectImportFiles(relativeDir: string): string[] 
 
 describe("opt-in extension package boundaries", () => {
   it("lists package boundary code files from git without walking package roots", () => {
-    const readDir = vi.spyOn(fs, "readdirSync");
-    try {
+    expectNoReaddirSyncDuring(() => {
       const memoryHostFiles = collectCodeFiles("packages/memory-host-sdk/src");
       const packageContractFiles = collectCodeFiles("packages/plugin-package-contract/src");
 
       expect(memoryHostFiles.length).toBeGreaterThan(0);
       expect(packageContractFiles.length).toBeGreaterThan(0);
-      expect(readDir).not.toHaveBeenCalled();
-    } finally {
-      readDir.mockRestore();
-    }
+    });
   });
 
   it("keeps path aliases in a dedicated shared config", () => {
@@ -202,6 +195,13 @@ describe("opt-in extension package boundaries", () => {
     expect(tsconfig.compilerOptions?.outDir).toBe("dist");
     expect(tsconfig.compilerOptions?.rootDir).toBe("../..");
     expect(tsconfig.include).toEqual([
+      "../../packages/markdown-core/src/**/*.ts",
+      "../../packages/media-core/src/**/*.ts",
+      "../../packages/media-generation-core/src/**/*.ts",
+      "../../packages/model-catalog-core/src/**/*.ts",
+      "../../packages/normalization-core/src/**/*.ts",
+      "../../packages/acp-core/src/**/*.ts",
+      "../../packages/terminal-core/src/**/*.ts",
       "../../src/plugin-sdk/**/*.ts",
       "../../src/video-generation/dashscope-compatible.ts",
       "../../src/video-generation/types.ts",
@@ -228,6 +228,9 @@ describe("opt-in extension package boundaries", () => {
     expect(packageJson.exports?.["./core"]?.types).toBe("./dist/src/plugin-sdk/core.d.ts");
     expect(packageJson.exports?.["./error-runtime"]?.types).toBe(
       "./dist/src/plugin-sdk/error-runtime.d.ts",
+    );
+    expect(packageJson.exports?.["./exec-approvals-runtime"]?.types).toBe(
+      "./dist/src/plugin-sdk/exec-approvals-runtime.d.ts",
     );
     expect(packageJson.exports?.["./plugin-entry"]?.types).toBe(
       "./dist/src/plugin-sdk/plugin-entry.d.ts",

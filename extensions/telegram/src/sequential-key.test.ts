@@ -1,3 +1,4 @@
+// Telegram tests cover sequential key plugin behavior.
 import type { Chat, Message } from "grammy/types";
 import { describe, expect, it } from "vitest";
 import { getTelegramSequentialKey } from "./sequential-key.js";
@@ -142,10 +143,31 @@ describe("getTelegramSequentialKey", () => {
       "telegram:123:control",
     ],
     [
+      { message: mockMessage({ chat: mockChat({ id: 123 }), text: "/diagnostics" }) },
+      "telegram:123",
+    ],
+    [
+      {
+        message: mockMessage({
+          chat: mockChat({ id: 123 }),
+          text: "/diagnostics confirm abc123def456",
+        }),
+      },
+      "telegram:123",
+    ],
+    [
       { message: mockMessage({ chat: mockChat({ id: 123 }), text: "/export-session" }) },
       "telegram:123",
     ],
     [{ message: mockMessage({ chat: mockChat({ id: 123 }), text: "/export" }) }, "telegram:123"],
+    [
+      { message: mockMessage({ chat: mockChat({ id: 123 }), text: "/export-trajectory" }) },
+      "telegram:123",
+    ],
+    [
+      { message: mockMessage({ chat: mockChat({ id: 123 }), text: "/trajectory" }) },
+      "telegram:123",
+    ],
     [
       { message: mockMessage({ chat: mockChat({ id: 123 }), text: "/btw what is the time?" }) },
       "telegram:123:btw:1",

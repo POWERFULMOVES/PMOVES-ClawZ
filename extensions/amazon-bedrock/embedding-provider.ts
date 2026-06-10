@@ -1,10 +1,17 @@
+/**
+ * Amazon Bedrock embedding provider runtime. It normalizes model-specific
+ * request/response shapes across Titan, Cohere, Nova, and TwelveLabs models.
+ */
 import {
   debugEmbeddingsLog,
   sanitizeAndNormalizeEmbedding,
   type MemoryEmbeddingProvider,
   type MemoryEmbeddingProviderCreateOptions,
 } from "openclaw/plugin-sdk/memory-core-host-engine-embeddings";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  asOptionalRecord as asRecord,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 import { refreshAwsSharedConfigCacheForBedrock } from "./aws-credential-refresh.js";
 
 // ---------------------------------------------------------------------------
@@ -17,6 +24,7 @@ type BedrockEmbeddingClient = {
   dimensions?: number;
 };
 
+/** Default Bedrock embedding model used when no explicit model is configured. */
 export const DEFAULT_BEDROCK_EMBEDDING_MODEL = "amazon.titan-embed-text-v2:0";
 
 /** Request/response format family — each has a different API shape. */
@@ -258,12 +266,6 @@ function asNumberArray(value: unknown): number[] {
   return value;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
-
 function asNumberArrayBatch(value: unknown): number[][] {
   if (!Array.isArray(value)) {
     throw malformedBedrockEmbeddingResponse();
@@ -307,7 +309,7 @@ function parseCohereBatch(family: Family, raw: string): number[][] {
   return asNumberArrayBatch(embeddings);
 }
 
-export const __testing = {
+export const testing = {
   parseCohereBatch,
   parseSingle,
 };
@@ -331,7 +333,7 @@ export async function createBedrockEmbeddingProvider(
     family,
   });
 
-  const invoke = async (body: string): Promise<string> => {
+  const invoke = async (body: string, signal?: AbortSignal): Promise<string> => {
     await refreshAwsSharedConfigCacheForBedrock();
     const sdk = new BedrockRuntimeClient({ region: client.region });
     try {
@@ -342,6 +344,7 @@ export async function createBedrockEmbeddingProvider(
           contentType: "application/json",
           accept: "application/json",
         }),
+        signal ? { abortSignal: signal } : undefined,
       );
       return new TextDecoder().decode(res.body);
     } finally {
@@ -351,37 +354,46 @@ export async function createBedrockEmbeddingProvider(
 
   const isCohere = family === "cohere-v3" || family === "cohere-v4";
 
-  const embedSingle = async (text: string): Promise<number[]> => {
-    const raw = await invoke(buildBody(family, text, client.dimensions));
+  const embedSingle = async (text: string, signal?: AbortSignal): Promise<number[]> => {
+    const raw = await invoke(buildBody(family, text, client.dimensions), signal);
     return sanitizeAndNormalizeEmbedding(parseSingle(family, raw));
   };
 
   const embedCohere = async (
     texts: string[],
     inputType: "search_query" | "search_document",
+    signal?: AbortSignal,
   ): Promise<number[][]> => {
-    const raw = await invoke(buildCohereBody(family, texts, inputType, client.dimensions));
+    const raw = await invoke(buildCohereBody(family, texts, inputType, client.dimensions), signal);
     return parseCohereBatch(family, raw).map((e) => sanitizeAndNormalizeEmbedding(e));
   };
 
-  const embedQuery = async (text: string): Promise<number[]> => {
+  const embedQuery = async (
+    text: string,
+    optionsValue?: { signal?: AbortSignal },
+  ): Promise<number[]> => {
     if (!text.trim()) {
       return [];
     }
     if (isCohere) {
-      return (await embedCohere([text], "search_query"))[0] ?? [];
+      return (await embedCohere([text], "search_query", optionsValue?.signal))[0] ?? [];
     }
-    return embedSingle(text);
+    return embedSingle(text, optionsValue?.signal);
   };
 
-  const embedBatch = async (texts: string[]): Promise<number[][]> => {
+  const embedBatch = async (
+    texts: string[],
+    optionsLocal?: { signal?: AbortSignal },
+  ): Promise<number[][]> => {
     if (texts.length === 0) {
       return [];
     }
     if (isCohere) {
-      return embedCohere(texts, "search_document");
+      return embedCohere(texts, "search_document", optionsLocal?.signal);
     }
-    return Promise.all(texts.map((t) => (t.trim() ? embedSingle(t) : Promise.resolve([]))));
+    return Promise.all(
+      texts.map((t) => (t.trim() ? embedSingle(t, optionsLocal?.signal) : Promise.resolve([]))),
+    );
   };
 
   return {
@@ -457,3 +469,4 @@ export async function hasAwsCredentials(
     return false;
   }
 }
+export { testing as __testing };

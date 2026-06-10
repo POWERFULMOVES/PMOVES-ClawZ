@@ -1,3 +1,4 @@
+// Telegram tests cover bot message context.require mention plugin behavior.
 import { getRuntimeConfig } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -61,7 +62,7 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
     }
   });
 
-  it("keeps always-on ambient group messages as user requests by default", async () => {
+  it("keeps unmentioned always-on group messages as user requests by default", async () => {
     const ctx = await buildTelegramMessageContextForTest({
       message: buildForumMessage(),
       resolveGroupActivation: () => false,
@@ -72,12 +73,12 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
       }),
     });
 
-    expect(ctx?.ctxPayload.InboundTurnKind).toBe("user_request");
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
   });
 
-  it("marks always-on ambient group messages as room events when configured", async () => {
+  it("marks unmentioned always-on group messages as room events when configured", async () => {
     const ctx = await buildTelegramMessageContextForTest({
-      cfg: { messages: { groupChat: { ambientTurns: "room_event", mentionPatterns: [] } } },
+      cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
       message: buildForumMessage(),
       resolveGroupActivation: () => false,
       resolveGroupRequireMention: () => false,
@@ -87,12 +88,12 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
       }),
     });
 
-    expect(ctx?.ctxPayload.InboundTurnKind).toBe("room_event");
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("room_event");
   });
 
   it("keeps ambient abort phrases as user requests", async () => {
     const ctx = await buildTelegramMessageContextForTest({
-      cfg: { messages: { groupChat: { ambientTurns: "room_event", mentionPatterns: [] } } },
+      cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
       message: { ...buildForumMessage(), text: "stop" },
       resolveGroupActivation: () => false,
       resolveGroupRequireMention: () => false,
@@ -102,13 +103,13 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
       }),
     });
 
-    expect(ctx?.ctxPayload.InboundTurnKind).toBe("user_request");
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
   });
 
   it("keeps room events as context for the next direct group request", async () => {
     const groupHistories = new Map();
     await buildTelegramMessageContextForTest({
-      cfg: { messages: { groupChat: { ambientTurns: "room_event", mentionPatterns: [] } } },
+      cfg: { messages: { groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] } } },
       message: { ...buildForumMessage(99), text: "side chatter" },
       historyLimit: 10,
       groupHistories,
@@ -142,7 +143,7 @@ describe("buildTelegramMessageContext requireMention precedence", () => {
       }),
     });
 
-    expect(ctx?.ctxPayload.InboundTurnKind).toBe("user_request");
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("user_request");
     expect(ctx?.ctxPayload.Body).toContain("side chatter");
   });
 

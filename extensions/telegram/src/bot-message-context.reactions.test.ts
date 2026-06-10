@@ -1,3 +1,4 @@
+// Telegram tests cover bot message context.reactions plugin behavior.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BuildTelegramMessageContextParams } from "./bot-message-context.types.js";
 
@@ -86,7 +87,7 @@ describe("buildTelegramMessageContext reactions", () => {
         },
         messages: {
           ackReaction: "👀",
-          groupChat: { ambientTurns: "room_event", mentionPatterns: [] },
+          groupChat: { unmentionedInbound: "room_event", mentionPatterns: [] },
           statusReactions: { enabled: true },
         },
       },
@@ -101,7 +102,7 @@ describe("buildTelegramMessageContext reactions", () => {
       }),
     });
 
-    expect(ctx?.ctxPayload.InboundTurnKind).toBe("room_event");
+    expect(ctx?.ctxPayload.InboundEventKind).toBe("room_event");
     expect(ctx?.ackReactionPromise).toBeNull();
     expect(ctx?.statusReactionController).toBeNull();
     expect(createStatusReactionController).not.toHaveBeenCalled();
